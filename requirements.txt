@@ -1,0 +1,8 @@
+streamlit
+pandas
+plotly
+openpyxl
+scipy
+numpy
+pyotp
+qrcode[pil]
