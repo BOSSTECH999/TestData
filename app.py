@@ -212,9 +212,15 @@ st.markdown("""
 
 # ========== 数据目录 ==========
 DATA_DIR = "data"
-MODEL_DIR = "models"
+MODEL_BASE_DIR = "models"
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
+
+
+def get_model_dir(username):
+    """获取用户专属模型目录"""
+    model_dir = os.path.join(MODEL_BASE_DIR, username)
+    os.makedirs(model_dir, exist_ok=True)
+    return model_dir
 
 
 # ========== 工具函数 ==========
@@ -241,27 +247,33 @@ def detect_numeric_cols(df, skip_keywords=None):
     return numeric_cols
 
 
-def detect_category_cols(df, numeric_cols):
-    """识别分类列（非数值且非序号/日期等）"""
-    category_keywords = ["煤种", "类型", "类别", "品种", "等级", "分类", "来源", "产地"]
-    skip_keywords = ["序号", "编号", "标识", "时间", "日期", "备注", "样品", "名称"]
-    
-    cat_cols = []
+def get_classification_candidates(df, numeric_cols):
+    """获取所有候选分类列，返回 {列名: 是否推荐}。让用户自选，系统仅提供推荐参考。"""
+    # 关键词只用于推荐标记，不用于过滤
+    recommend_keywords = ["煤种", "类型", "类别", "品种", "等级", "分类", "来源", "产地",
+                          "供应商", "批次", "产线", "工段", "车间", "矿区", "品牌", "规格", "型号"]
+    skip_keywords = ["序号", "编号", "标识", "时间", "日期", "备注", "样品", "名称", "电话", "地址", "联系人"]
+
+    candidates = {}
     for col in df.columns:
         if col in numeric_cols:
             continue
         if any(kw in str(col) for kw in skip_keywords):
             continue
-        # 优先匹配关键词
-        if any(kw in str(col) for kw in category_keywords):
-            cat_cols.append(col)
-            continue
-        # 其他非数值列，如果唯一值数量少于总数的30%，可能是分类
-        unique_vals = df[col].dropna().nunique()
-        total_vals = len(df[col].dropna())
-        if total_vals > 0 and unique_vals / total_vals < 0.3 and unique_vals >= 2:
-            cat_cols.append(col)
-    return cat_cols
+
+        # 推荐逻辑：关键词匹配 > 唯一值比例判断
+        recommended = False
+        if any(kw in str(col) for kw in recommend_keywords):
+            recommended = True
+        else:
+            unique_vals = df[col].dropna().nunique()
+            total_vals = len(df[col].dropna())
+            if total_vals > 0 and unique_vals / total_vals < 0.3 and unique_vals >= 2:
+                recommended = True
+
+        candidates[col] = recommended
+
+    return candidates
 
 
 def load_data(uploaded_file):
@@ -483,10 +495,11 @@ def check_anomaly(new_row, model, history_df=None):
     return anomalies
 
 
-def save_model(model, name):
-    """保存模型到文件，用友好名称"""
+def save_model(model, name, username):
+    """保存模型到用户专属目录"""
     safe_name = name.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    filepath = os.path.join(MODEL_DIR, f"{safe_name}.json")
+    model_dir = get_model_dir(username)
+    filepath = os.path.join(model_dir, f"{safe_name}.json")
     # 在模型内保存友好名称
     model["display_name"] = name
     with open(filepath, "w", encoding="utf-8") as f:
@@ -500,13 +513,16 @@ def load_model_file(filepath):
         return json.load(f)
 
 
-def get_saved_models():
-    """获取所有已保存的模型"""
+def get_saved_models(username=None):
+    """获取当前用户已保存的模型"""
     models = []
-    if os.path.exists(MODEL_DIR):
-        for f in os.listdir(MODEL_DIR):
+    if not username:
+        return models
+    model_dir = get_model_dir(username)
+    if os.path.exists(model_dir):
+        for f in os.listdir(model_dir):
             if f.endswith(".json"):
-                filepath = os.path.join(MODEL_DIR, f)
+                filepath = os.path.join(model_dir, f)
                 try:
                     m = load_model_file(filepath)
                     # 优先使用模型内的友好名称
@@ -528,7 +544,7 @@ def get_saved_models():
     return models
 
 
-def get_model_display_name(model_name, model=None):
+def get_model_display_name(model_name, model=None, username=None):
     """获取模型的友好显示名称"""
     if model and model.get("display_name"):
         return model["display_name"]
@@ -537,7 +553,7 @@ def get_model_display_name(model_name, model=None):
         group_col = model.get("group_col", "分类")
         return f"{group_col}：{model['group_value']}"
     # 从已保存模型中查找
-    saved = get_saved_models()
+    saved = get_saved_models(username)
     for sm in saved:
         if sm["name"] == model_name:
             if sm.get("display_name") and sm["display_name"] != model_name:
@@ -1153,7 +1169,7 @@ if page == "🏠 首页":
     
     # 系统状态
     st.subheader("📊 系统状态")
-    saved = get_saved_models()
+    saved = get_saved_models(st.session_state.current_user)
     model_count = len(saved)
     total_samples = sum(sm.get("sample_count", 0) for sm in saved) if saved else 0
     has_data = st.session_state.df_raw is not None
@@ -1193,9 +1209,9 @@ if page == "📤 数据上传":
     st.header("📤 第一步：上传历史数据")
     
     st.warning("⚠️ **数据上传须知**\n\n"
-               "- 请**剔除敏感信息**（客户名称、价格等），只保留检测项目和分类信息（如煤种）\n"
+               "- 请**剔除敏感信息**（客户名称、价格等），只保留检测项目和分类信息（如供应商、批次、产线等）\n"
                "- 数据格式：**列=检测项目**，**行=样品记录**（如果反过来系统会自动识别）\n"
-               "- 保留分类列（如煤种、类别），系统会按分类分别建模\n"
+               "- 保留分类列（如供应商、批次、类别），系统会按分类分别建模\n"
                "- 支持 .xlsx / .xls 格式，可一次上传多个文件")
     
     uploaded_files = st.file_uploader(
@@ -1228,33 +1244,44 @@ if page == "📤 数据上传":
             
             # 识别列
             numeric_cols = detect_numeric_cols(df_raw)
-            category_cols = detect_category_cols(df_raw, numeric_cols)
-            
+            candidates = get_classification_candidates(df_raw, numeric_cols)
+
             st.session_state.df_raw = df_raw
             st.session_state.numeric_cols = numeric_cols
-            st.session_state.category_cols = category_cols
-            
-            st.success(f"✅ 数据读取成功！共 {len(df_raw)} 条记录，识别到 {len(numeric_cols)} 个检测项目，{len(category_cols)} 个分类列")
-            
+
+            st.success(f"✅ 数据读取成功！共 {len(df_raw)} 条记录，识别到 {len(numeric_cols)} 个检测项目")
+
             # 数据预览
             with st.expander("📋 数据预览（前20行）", expanded=True):
                 st.dataframe(df_raw.head(20), use_container_width=True)
-            
-            # 识别结果
+
+            # 识别结果 + 分类列自选
             col1, col2 = st.columns(2)
             with col1:
                 st.subheader(f"检测项目（{len(numeric_cols)}个）")
                 for c in numeric_cols:
                     st.markdown(f"- {c}")
             with col2:
-                if category_cols:
-                    st.subheader(f"分类列（{len(category_cols)}个）")
-                    for c in category_cols:
-                        unique_vals = df_raw[c].dropna().unique()
-                        st.markdown(f"- **{c}**：{', '.join([str(v) for v in unique_vals[:10]])}")
+                if candidates:
+                    st.subheader("📌 请勾选分类列")
+                    st.caption("系统已预选推荐项，你可以根据需要调整。分类列将用于分组建模。")
+                    selected_cats = []
+                    for col_name, recommended in candidates.items():
+                        unique_vals = df_raw[col_name].dropna().unique()
+                        val_preview = "、".join([str(v) for v in unique_vals[:5]])
+                        more = f"…等{len(unique_vals)}个值" if len(unique_vals) > 5 else f"（{len(unique_vals)}个值）"
+                        label = f"**{col_name}**  示例：{val_preview}{more}"
+                        if st.checkbox(label, value=recommended, key=f"sel_cat_{col_name}"):
+                            selected_cats.append(col_name)
+                    st.session_state.category_cols = selected_cats
+                    if selected_cats:
+                        st.success(f"已选择 {len(selected_cats)} 个分类列：{'、'.join(selected_cats)}")
+                    else:
+                        st.info("未选择分类列，将使用全部数据一起建模")
                 else:
                     st.subheader("分类列")
-                    st.info("未识别到分类列，将使用全部数据建模")
+                    st.info("未找到候选分类列，将使用全部数据建模")
+                    st.session_state.category_cols = []
             
             # 如果没有识别到数值列
             if len(numeric_cols) == 0:
@@ -1449,7 +1476,7 @@ elif page == "🔧 项目设置" or page == "🧠 模型训练":
                     
                     # 保存模型
                     model_name = f"{selected_group_col}_{group_val}" if group_val else "全部数据"
-                    save_model(model, model_name)
+                    save_model(model, model_name, st.session_state.current_user)
                     st.session_state.models[model_name] = model
                     trained_models.append((model_name, model))
                     
@@ -1497,7 +1524,7 @@ elif page == "📊 相关性分析":
     st.markdown("分析检测项目之间的统计相关性，发现项目间的内在规律。")
     
     # 选择模型
-    saved = get_saved_models()
+    saved = get_saved_models(st.session_state.current_user)
     current_models = list(st.session_state.models.keys())
     all_model_names = list(set(sm["name"] for sm in saved) | set(current_models))
     
@@ -1508,7 +1535,7 @@ elif page == "📊 相关性分析":
         name_map = {}
         for mn in all_model_names:
             m = st.session_state.models.get(mn)
-            display = get_model_display_name(mn, m)
+            display = get_model_display_name(mn, m, st.session_state.current_user)
             if m:
                 group_info = f"（{m.get('group_value', '')}）" if m.get('group_value') and m.get('group_value') != '全部' else ""
                 display = f"{display}{group_info} | {m.get('sample_count', '?')}条数据"
@@ -1695,7 +1722,7 @@ elif page == "🔍 数据智能分析":
     st.header("🔍 数据智能分析")
     
     # 获取所有可用模型
-    saved = get_saved_models()
+    saved = get_saved_models(st.session_state.current_user)
     current_models = list(st.session_state.models.keys())
     all_model_names = list(set(sm["name"] for sm in saved) | set(current_models))
     
@@ -1711,7 +1738,7 @@ elif page == "🔍 数据智能分析":
             name_map = {}
             for mn in all_model_names:
                 m = st.session_state.models.get(mn)
-                display = get_model_display_name(mn, m)
+                display = get_model_display_name(mn, m, st.session_state.current_user)
                 if m:
                     group_info = f"（{m.get('group_value', '')}）" if m.get('group_value') and m.get('group_value') != '全部' else ""
                     display = f"{display}{group_info} | {m.get('sample_count', '?')}条数据"
@@ -1762,10 +1789,10 @@ elif page == "🔍 数据智能分析":
                         # 统一格式，给手动输入的异常也加行号和模型信息
                         for a in anomalies:
                             a["行号"] = 1
-                            a["使用模型"] = get_model_display_name(selected_model_name, model)
+                            a["使用模型"] = get_model_display_name(selected_model_name, model, st.session_state.current_user)
                         st.session_state["latest_anomalies"] = anomalies
                         st.session_state["latest_data"] = {"mode": "manual", "data": new_data}
-                        st.session_state["latest_model"] = get_model_display_name(selected_model_name, model)
+                        st.session_state["latest_model"] = get_model_display_name(selected_model_name, model, st.session_state.current_user)
                         # 手动输入的数据自动记录到新数据中，不丢失
                         new_row_df = pd.DataFrame([new_data])
                         if st.session_state.new_data is None:
@@ -1821,7 +1848,7 @@ elif page == "🔍 数据智能分析":
                                         max_data_count=st.session_state.get("max_data_count", 500)
                                     )
 
-                                    save_model(new_model, selected_model_name)
+                                    save_model(new_model, selected_model_name, st.session_state.current_user)
                                     st.session_state.models[selected_model_name] = new_model
 
                                     # 从 new_data 中移除已纳入模型的数据
@@ -1841,7 +1868,7 @@ elif page == "🔍 数据智能分析":
         
         else:
             # 上传Excel：自动匹配模型
-            st.markdown("💡 上传Excel后，系统将根据分类列（如煤种）**自动匹配对应模型**进行分析。")
+            st.markdown("💡 上传Excel后，系统将根据分类列（如供应商、批次、产线等）**自动匹配对应模型**进行分析。")
             
             daily_file = st.file_uploader("上传检测数据", type=["xlsx", "xls"], key="daily_upload")
             
@@ -1849,9 +1876,22 @@ elif page == "🔍 数据智能分析":
                 df_daily = load_data(daily_file)
                 st.dataframe(df_daily.head(20), use_container_width=True)
                 
-                # 识别分类列
+                # 识别分类列（用户自选，系统推荐）
                 daily_numeric_cols = detect_numeric_cols(df_daily)
-                daily_category_cols = detect_category_cols(df_daily, daily_numeric_cols)
+                daily_candidates = get_classification_candidates(df_daily, daily_numeric_cols)
+                if daily_candidates:
+                    st.subheader("📌 请勾选用于匹配模型的分类列")
+                    st.caption("系统会按此列的值自动匹配对应模型进行异常检测。")
+                    daily_category_cols = []
+                    for col_name, recommended in daily_candidates.items():
+                        unique_vals = df_daily[col_name].dropna().unique()
+                        val_preview = "、".join([str(v) for v in unique_vals[:5]])
+                        more = f"…等{len(unique_vals)}个值" if len(unique_vals) > 5 else f"（{len(unique_vals)}个值）"
+                        label = f"**{col_name}**  示例：{val_preview}{more}"
+                        if st.checkbox(label, value=recommended, key=f"daily_cat_{col_name}"):
+                            daily_category_cols.append(col_name)
+                else:
+                    daily_category_cols = []
                 
                 # 构建所有可用模型的映射：group_col + group_value → model
                 model_map = {}  # key: (group_col, group_value), value: model
@@ -1895,7 +1935,7 @@ elif page == "🔍 数据智能分析":
                                 for (gcol, gval), m in model_map.items():
                                     if cat_val == gval:
                                         matched_model = m
-                                        matched_model_name = get_model_display_name(gcol + "_" + gval, m)
+                                        matched_model_name = get_model_display_name(gcol + "_" + gval, m, st.session_state.current_user)
                                         break
                             if matched_model:
                                 break
@@ -1903,8 +1943,8 @@ elif page == "🔍 数据智能分析":
                         # 没匹配到分组模型，用通用模型
                         if not matched_model and no_group_models:
                             matched_model = no_group_models[0]
-                            matched_model_name = get_model_display_name("全部数据", matched_model)
-                        
+                            matched_model_name = get_model_display_name("全部数据", matched_model, st.session_state.current_user)
+
                         if matched_model:
                             anomalies = check_anomaly(row_numeric, matched_model)
                             desc_list = []
@@ -2017,7 +2057,7 @@ elif page == "🔍 数据智能分析":
                                             decimal_settings=decimal_settings,
                                             max_data_count=st.session_state.get("max_data_count", 500)
                                         )
-                                        save_model(new_model, mn)
+                                        save_model(new_model, mn, st.session_state.current_user)
                                         st.session_state.models[mn] = new_model
                                         updated_count += 1
                                 
@@ -2170,8 +2210,8 @@ elif page == "📋 异常报告":
 elif page == "📁 模型管理":
     st.header("📁 模型管理")
     
-    saved = get_saved_models()
-    
+    saved = get_saved_models(st.session_state.current_user)
+
     if not saved:
         st.info("暂无已保存的模型，请先上传数据并训练")
     else:
@@ -2201,7 +2241,7 @@ elif page == "📁 模型管理":
             st.markdown("---")
             st.subheader("已加载的模型")
             for name, model in st.session_state.models.items():
-                display_name = get_model_display_name(name, model)
+                display_name = get_model_display_name(name, model, st.session_state.current_user)
                 with st.expander(f"📊 {display_name}"):
                     stats_data = []
                     for col, info in model.get("item_stats", {}).items():
@@ -2234,11 +2274,12 @@ elif page == "📁 模型管理":
                 st.session_state.numeric_cols = []
                 st.session_state.category_cols = []
                 st.session_state.decimal_settings = {}
-                # 删除所有模型文件
-                if os.path.exists(MODEL_DIR):
-                    for f in os.listdir(MODEL_DIR):
+                # 删除当前用户所有模型文件
+                model_dir = get_model_dir(st.session_state.current_user)
+                if os.path.exists(model_dir):
+                    for f in os.listdir(model_dir):
                         if f.endswith(".json"):
-                            os.remove(os.path.join(MODEL_DIR, f))
+                            os.remove(os.path.join(model_dir, f))
                 st.success("✅ 已重置所有模型和数据")
                 st.rerun()
         
