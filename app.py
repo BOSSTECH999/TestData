@@ -292,9 +292,9 @@ def build_model(df_numeric, numeric_cols, group_col=None, group_value=None, deci
     
     # 滑动窗口：只保留最近 max_data_count 条数据
     if max_data_count and len(df_numeric) > max_data_count:
+        model["original_count"] = len(df_numeric)
         df_numeric = df_numeric.iloc[-max_data_count:]
         model["data_trimmed"] = True
-        model["original_count"] = len(df_numeric) + (len(df_numeric) - max_data_count)
     else:
         model["data_trimmed"] = False
     
@@ -402,18 +402,20 @@ def check_anomaly(new_row, model, history_df=None):
         decimals = stats_info.get("decimals", 3)
         
         if z_score > 3:
+            direction = "严重偏高" if val > stats_info["mean"] else "严重偏低"
             anomalies.append({
                 "项目": col,
-                "类型": "🔴 严重异常",
+                "类型": f"🔴 {direction}",
                 "检测值": round(val, decimals),
                 "正常范围": f"{round(stats_info['mean']-3*stats_info['std'], decimals)} ~ {round(stats_info['mean']+3*stats_info['std'], decimals)}",
                 "偏离程度": f"Z={z_score:.1f}σ",
                 "说明": f"偏离均值{z_score:.1f}个标准差"
             })
         elif val < stats_info["lower_fence"] or val > stats_info["upper_fence"]:
+            direction = "偏高" if val > stats_info["upper_fence"] else "偏低"
             anomalies.append({
                 "项目": col,
-                "类型": "🟡 轻度异常",
+                "类型": f"🟡 {direction}",
                 "检测值": round(val, decimals),
                 "正常范围": f"{round(stats_info['lower_fence'], decimals)} ~ {round(stats_info['upper_fence'], decimals)}",
                 "偏离程度": f"Z={z_score:.1f}σ",
@@ -429,7 +431,7 @@ def check_anomaly(new_row, model, history_df=None):
                 if val == hist_max and val > stats_info["mean"]:
                     anomalies.append({
                         "项目": col,
-                        "类型": "⬆️ 历史最高值",
+                        "类型": "⬆️ 创历史新高",
                         "检测值": round(val, decimals),
                         "正常范围": f"历史范围：{round(hist_min, decimals)} ~ {round(hist_max, decimals)}",
                         "偏离程度": f"均值={stats_info['mean']}",
@@ -438,7 +440,7 @@ def check_anomaly(new_row, model, history_df=None):
                 elif val == hist_min and val < stats_info["mean"]:
                     anomalies.append({
                         "项目": col,
-                        "类型": "⬇️ 历史最低值",
+                        "类型": "⬇️ 创历史新低",
                         "检测值": round(val, decimals),
                         "正常范围": f"历史范围：{round(hist_min, decimals)} ~ {round(hist_max, decimals)}",
                         "偏离程度": f"均值={stats_info['mean']}",
@@ -467,13 +469,15 @@ def check_anomaly(new_row, model, history_df=None):
         
         if reg["residual_std"] > 0 and residual > 2.5 * reg["residual_std"]:
             dec = model["item_stats"].get(col_b, {}).get("decimals", 3)
+            updown = "应该同步变化" if pair["direction"] == "正相关" else "应该此消彼长"
+            rule = f"按历史规律，{col_a}涨{col_b}也涨" if pair["direction"] == "正相关" else f"按历史规律，{col_a}越高{col_b}越低"
             anomalies.append({
-                "项目": f"{col_a} → {col_b}",
-                "类型": "🔵 逻辑异常",
+                "项目": col_a,
+                "类型": f"🔵 {col_a}与{col_b}搭配异常",
                 "检测值": f"{col_a}={round(val_a, dec)}, {col_b}={round(val_b, dec)}",
                 "正常范围": f"{col_b}应在{round(predicted_b-2.5*reg['residual_std'], dec)} ~ {round(predicted_b+2.5*reg['residual_std'], dec)}",
-                "偏离程度": f"残差={residual:.2f}",
-                "说明": f"两项目{pair['direction']}(r={pair['r']:.2f})，当前组合不符合历史规律"
+                "偏离程度": f"{residual:.1f}",
+                "说明": f"{rule}，但当前{col_a}={round(val_a, dec)}时{col_b}={round(val_b, dec)}，{updown}才对"
             })
     
     return anomalies
@@ -562,6 +566,8 @@ if "login_time" not in st.session_state:
     st.session_state.login_time = None
 if "pending_2fa_user" not in st.session_state:
     st.session_state.pending_2fa_user = None
+if "new_data" not in st.session_state:
+    st.session_state.new_data = None  # 暂存手动输入记录
 
 # ========== 用户管理 ==========
 USER_DIR = "users"
@@ -1051,10 +1057,9 @@ if st.sidebar.button("🚪 退出登录", use_container_width=True):
 page_options = [
     "🏠 首页",
     "📤 数据上传",
-    "🔧 项目设置", 
+    "🔧 项目设置",
     "🧠 模型训练",
     "📊 相关性分析",
-    "📈 智能诊断",
     "🔍 数据智能分析",
     "📋 异常报告",
     "📁 模型管理",
@@ -1064,6 +1069,10 @@ if is_admin:
     page_options.append("⚙️ 用户管理")
 
 page = st.sidebar.radio("功能导航", page_options)
+
+# 首页快捷导航跳转
+if "nav_target" in st.session_state:
+    page = st.session_state.pop("nav_target")
 
 # 侧边栏底部信息
 st.sidebar.markdown("---")
@@ -1124,37 +1133,21 @@ if page == "🏠 首页":
     
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.markdown("""
-        <div class="quick-card">
-            <div class="quick-icon">📤</div>
-            <div class="quick-title">上传数据</div>
-            <div class="quick-desc">导入Excel历史数据</div>
-        </div>
-        """, unsafe_allow_html=True)
+        if st.button("📤\n上传数据\n导入Excel历史数据", use_container_width=True, key="nav_upload"):
+            st.session_state["nav_target"] = "📤 数据上传"
+            st.rerun()
     with col2:
-        st.markdown("""
-        <div class="quick-card">
-            <div class="quick-icon">🧠</div>
-            <div class="quick-title">训练模型</div>
-            <div class="quick-desc">按分类智能建模</div>
-        </div>
-        """, unsafe_allow_html=True)
+        if st.button("🧠\n训练模型\n按分类智能建模", use_container_width=True, key="nav_train"):
+            st.session_state["nav_target"] = "🧠 模型训练"
+            st.rerun()
     with col3:
-        st.markdown("""
-        <div class="quick-card">
-            <div class="quick-icon">🔍</div>
-            <div class="quick-title">智能分析</div>
-            <div class="quick-desc">检测数据异常</div>
-        </div>
-        """, unsafe_allow_html=True)
+        if st.button("🔍\n智能分析\n检测数据异常", use_container_width=True, key="nav_analyze"):
+            st.session_state["nav_target"] = "🔍 数据智能分析"
+            st.rerun()
     with col4:
-        st.markdown("""
-        <div class="quick-card">
-            <div class="quick-icon">📋</div>
-            <div class="quick-title">异常报告</div>
-            <div class="quick-desc">查看分析结果</div>
-        </div>
-        """, unsafe_allow_html=True)
+        if st.button("📋\n异常报告\n查看分析结果", use_container_width=True, key="nav_report"):
+            st.session_state["nav_target"] = "📋 异常报告"
+            st.rerun()
     
     st.markdown("---")
     
@@ -1311,21 +1304,39 @@ elif page == "🔧 项目设置":
                 auto_decimals[col] = 2
         
         # 显示设置表格
-        st.subheader("小数位设置")
+        st.subheader("项目选取与小数位设置")
+        st.caption("勾选「纳入」的项目将用于模型训练。小数位影响模型精度和显示格式。")
+
+        # 初始化项目选择
+        if "selected_cols" not in st.session_state:
+            st.session_state.selected_cols = list(numeric_cols)
+
         cols_per_row = 3
         for i in range(0, len(numeric_cols), cols_per_row):
             row_cols = st.columns(cols_per_row)
             for j, col_name in enumerate(numeric_cols[i:i+cols_per_row]):
                 with row_cols[j]:
+                    st.markdown(f"**{col_name}**")
+                    use_col = st.checkbox(
+                        "纳入模型",
+                        value=col_name in st.session_state.selected_cols,
+                        key=f"use_{col_name}",
+                    )
                     default_dec = st.session_state.decimal_settings.get(col_name, auto_decimals.get(col_name, 2))
                     dec = st.number_input(
-                        f"{col_name}", 
-                        min_value=0, max_value=6, 
-                        value=default_dec, 
+                        "小数位",
+                        min_value=0, max_value=6,
+                        value=default_dec,
                         key=f"dec_{col_name}",
                         help=f"自动推断：{auto_decimals.get(col_name, 2)}位"
                     )
                     st.session_state.decimal_settings[col_name] = int(dec)
+
+        # 更新已选列表
+        st.session_state.selected_cols = [
+            c for c in numeric_cols if st.session_state.get(f"use_{c}", True)
+        ]
+        st.markdown(f"已选 **{len(st.session_state.selected_cols)}/{len(numeric_cols)}** 个项目用于建模")
         
         st.markdown("---")
         st.info("💡 设置完成后，去 **🧠 模型训练** 选择分类方式并开始建模")
@@ -1340,9 +1351,13 @@ elif page == "🔧 项目设置" or page == "🧠 模型训练":
         numeric_cols = st.session_state.get("numeric_cols", [])
         category_cols = st.session_state.get("category_cols", [])
         decimal_settings = st.session_state.get("decimal_settings", {})
-        
+
+        # 应用项目选取
+        selected_cols = st.session_state.get("selected_cols", numeric_cols)
+        numeric_cols = [c for c in numeric_cols if c in selected_cols]
+
         if df_raw is None or len(numeric_cols) == 0:
-            st.warning("⚠️ 请先上传数据并确认项目设置")
+            st.warning("⚠️ 请先上传数据并确认项目设置（可能所有项目都被取消了选择）")
         else:
             # 选择分类方式
             st.subheader("选择建模分类")
@@ -1542,15 +1557,13 @@ elif page == "📊 相关性分析":
                         else:
                             strength = "🟡 中等"
                         
-                        direction_text = "同增同减" if pair["direction"] == "正相关" else "此消彼长"
-                        
                         pair_data.append({
                             "项目A": pair["col_a"],
                             "项目B": pair["col_b"],
-                            "方向": pair["direction"],
-                            "相关系数r": pair["r"],
+                            "变化关系": "同步变化" if pair["direction"] == "正相关" else "此消彼长",
+                            "相关度": pair["r"],
                             "强度": strength,
-                            "实际含义": f"{pair['col_a']}↑ 则 {pair['col_b']}↑" if pair["direction"] == "正相关" else f"{pair['col_a']}↑ 则 {pair['col_b']}↓"
+                            "通俗理解": f"{pair['col_a']}涨 → {pair['col_b']}也涨" if pair["direction"] == "正相关" else f"{pair['col_a']}涨 → {pair['col_b']}降"
                         })
                     
                     pair_df = pd.DataFrame(pair_data)
@@ -1560,11 +1573,11 @@ elif page == "📊 相关性分析":
                     st.subheader("💡 规律解读")
                     for pair in strong_pairs[:10]:  # 最多展示10对
                         icon = "📈" if pair["direction"] == "正相关" else "📉"
-                        st.markdown(f"{icon} **{pair['col_a']}** 与 **{pair['col_b']}**：{pair['direction']}（r = {pair['r']}）")
+                        st.markdown(f"{icon} **{pair['col_a']}** 与 **{pair['col_b']}**：{pair['direction']}（相关度 = {pair['r']}）")
                         if pair["direction"] == "负相关":
-                            st.caption(f"→ {pair['col_a']}越{pair['col_a']}，{pair['col_b']}越低，两者此消彼长")
+                            st.caption(f"→ {pair['col_a']}越高，{pair['col_b']}越低，两者反着走")
                         else:
-                            st.caption(f"→ {pair['col_a']}和{pair['col_b']}同方向变化，一个高另一个也高")
+                            st.caption(f"→ {pair['col_a']}和{pair['col_b']}同涨同跌，一个高了另一个也高")
                 else:
                     st.info("未发现强相关项目对（|r| > 0.5）。可能原因：数据量不足、混合了不同类型数据、或项目间确实无强相关。")
                 
@@ -1589,7 +1602,7 @@ elif page == "📊 相关性分析":
                 )
                 st.plotly_chart(fig_heatmap, use_container_width=True)
                 
-                st.caption("💡 **读图说明**：颜色越红表示正相关越强（同增同减），越蓝表示负相关越强（此消彼长），白色表示无明显相关。")
+                st.caption("💡 **读图说明**：越红→同涨同跌关系越强，越蓝→反着走关系越强，白色→没啥关系。")
                 
                 # ===== 3. 散点图 =====
                 if strong_pairs:
@@ -1753,6 +1766,14 @@ elif page == "🔍 数据智能分析":
                         st.session_state["latest_anomalies"] = anomalies
                         st.session_state["latest_data"] = {"mode": "manual", "data": new_data}
                         st.session_state["latest_model"] = get_model_display_name(selected_model_name, model)
+                        # 手动输入的数据自动记录到新数据中，不丢失
+                        new_row_df = pd.DataFrame([new_data])
+                        if st.session_state.new_data is None:
+                            st.session_state.new_data = new_row_df.copy()
+                        else:
+                            st.session_state.new_data = pd.concat(
+                                [st.session_state.new_data, new_row_df], ignore_index=True
+                            )
                         
                         if anomalies:
                             st.error(f"⚠️ 发现 {len(anomalies)} 个异常！")
@@ -1775,8 +1796,11 @@ elif page == "🔍 数据智能分析":
                                     new_row_df = pd.DataFrame([new_data])
                                     df_raw = pd.concat([df_raw, new_row_df], ignore_index=True)
                                     st.session_state.df_raw = df_raw
-                                    
+                                    # 注：new_data 已在「开始分析」时记录，这里不再重复追加
+
                                     numeric_cols_session = st.session_state.get("numeric_cols", [])
+                                    selected_cols = st.session_state.get("selected_cols", numeric_cols_session)
+                                    numeric_cols_session = [c for c in numeric_cols_session if c in selected_cols]
                                     decimal_settings = st.session_state.get("decimal_settings", {})
                                     df_numeric = df_raw[numeric_cols_session].apply(pd.to_numeric, errors='coerce')
                                     
@@ -1796,10 +1820,16 @@ elif page == "🔍 数据智能分析":
                                         decimal_settings=decimal_settings,
                                         max_data_count=st.session_state.get("max_data_count", 500)
                                     )
-                                    
+
                                     save_model(new_model, selected_model_name)
                                     st.session_state.models[selected_model_name] = new_model
-                                    
+
+                                    # 从 new_data 中移除已纳入模型的数据
+                                    if st.session_state.new_data is not None and len(st.session_state.new_data) > 0:
+                                        st.session_state.new_data = st.session_state.new_data.iloc[:-1]
+                                        if len(st.session_state.new_data) == 0:
+                                            st.session_state.new_data = None
+
                                     st.success(f"✅ 模型已更新！样本量：{model['sample_count']} → {new_model['sample_count']}")
                                     st.rerun()
                                 else:
@@ -1877,12 +1907,19 @@ elif page == "🔍 数据智能分析":
                         
                         if matched_model:
                             anomalies = check_anomaly(row_numeric, matched_model)
+                            desc_list = []
+                            for a in anomalies:
+                                item = a["项目"]
+                                atype = a["类型"]
+                                # 逻辑异常已经包含项目名，不需要重复
+                                if "关系异常" in atype:
+                                    desc_list.append(atype)
+                                else:
+                                    desc_list.append(f"{item}{atype}")
                             result = {
                                 "行号": idx + 1,
                                 "使用模型": matched_model_name,
-                                "异常数量": len(anomalies),
-                                "异常项目": "、".join([a["项目"] for a in anomalies]) if anomalies else "无",
-                                "异常类型": "、".join([a["类型"] for a in anomalies]) if anomalies else "-"
+                                "异常说明": "、".join(desc_list) if desc_list else "正常",
                             }
                             all_results.append(result)
                             # 保存异常详情，供异常报告页使用
@@ -1896,9 +1933,7 @@ elif page == "🔍 数据智能分析":
                             all_results.append({
                                 "行号": idx + 1,
                                 "使用模型": "⚠️ 未匹配",
-                                "异常数量": "-",
-                                "异常项目": "-",
-                                "异常类型": "未找到对应模型"
+                                "异常说明": "未找到匹配模型"
                             })
                     
                     # 保存到session_state，供异常报告页使用
@@ -1908,12 +1943,10 @@ elif page == "🔍 数据智能分析":
                     
                     # 展示结果
                     result_df = pd.DataFrame(all_results)
-                    anomaly_count = len(result_df[result_df["异常数量"] != "-"])
-                    has_anomaly_count = len(result_df[result_df["异常数量"].apply(lambda x: x != "-" and x > 0 if isinstance(x, int) else x == "🔴 严重异常" or x == "🟡 轻度异常" or x == "🔵 逻辑异常")])
-                    
+
                     # 统计
-                    anomaly_rows = result_df[result_df["异常数量"].apply(lambda x: isinstance(x, int) and x > 0)]
-                    normal_rows = result_df[result_df["异常数量"] == 0]
+                    anomaly_rows = result_df[result_df["异常说明"] != "正常"]
+                    normal_rows = result_df[result_df["异常说明"] == "正常"]
                     no_model_rows = result_df[result_df["使用模型"] == "⚠️ 未匹配"]
                     
                     st.subheader("📊 批量分析结果")
@@ -1950,9 +1983,18 @@ elif page == "🔍 数据智能分析":
                                 df_daily_numeric = df_daily[daily_numeric_cols].apply(pd.to_numeric, errors='coerce')
                                 df_raw = pd.concat([df_raw, df_daily], ignore_index=True)
                                 st.session_state.df_raw = df_raw
+                                # 累积新数据用于智能诊断
+                                if st.session_state.new_data is None:
+                                    st.session_state.new_data = df_daily.copy()
+                                else:
+                                    st.session_state.new_data = pd.concat(
+                                        [st.session_state.new_data, df_daily], ignore_index=True
+                                    )
                                 
                                 # 重新训练所有受影响的模型
                                 numeric_cols_session = st.session_state.get("numeric_cols", [])
+                                selected_cols = st.session_state.get("selected_cols", numeric_cols_session)
+                                numeric_cols_session = [c for c in numeric_cols_session if c in selected_cols]
                                 decimal_settings = st.session_state.get("decimal_settings", {})
                                 df_numeric = df_raw[numeric_cols_session].apply(pd.to_numeric, errors='coerce')
                                 
@@ -1979,6 +2021,9 @@ elif page == "🔍 数据智能分析":
                                         st.session_state.models[mn] = new_model
                                         updated_count += 1
                                 
+                                # 清除 new_data（这批数据已全部纳入模型）
+                                st.session_state.new_data = None
+
                                 st.success(f"✅ 已将 {total_rows} 条数据纳入模型，共更新 {updated_count} 个模型")
                                 st.rerun()
                             else:
@@ -1989,276 +2034,7 @@ elif page == "🔍 数据智能分析":
                             st.info("数据未纳入模型，模型保持不变")
 
 
-# ==================== 页面6：智能诊断 ====================
-elif page == "📈 智能诊断":
-    st.header("📈 智能诊断")
-    st.markdown("深度分析数据趋势、波动率和异常规律，提前发现潜在问题。")
-    
-    # 选择模型
-    saved = get_saved_models()
-    current_models = list(st.session_state.models.keys())
-    all_model_names = list(set(sm["name"] for sm in saved) | set(current_models))
-    
-    if not all_model_names:
-        st.warning("⚠️ 请先训练模型")
-    else:
-        name_map = {}
-        for mn in all_model_names:
-            m = st.session_state.models.get(mn)
-            display = get_model_display_name(mn, m)
-            if m:
-                group_info = f"（{m.get('group_value', '')}）" if m.get('group_value') and m.get('group_value') != '全部' else ""
-                display = f"{display}{group_info} | {m.get('sample_count', '?')}条数据"
-            else:
-                for sm in saved:
-                    if sm["name"] == mn:
-                        group_info = f"（{sm['group']}）" if sm['group'] != '全部' else ""
-                        display = f"{sm['display_name']}{group_info} | {sm['sample_count']}条数据"
-                        break
-            name_map[display] = mn
-        
-        selected_display = st.selectbox("选择模型", list(name_map.keys()), key="diag_model_select")
-        selected_model_name = name_map[selected_display]
-        
-        model = st.session_state.models.get(selected_model_name)
-        if not model:
-            for sm in saved:
-                if sm["name"] == selected_model_name:
-                    model = load_model_file(sm["filepath"])
-                    st.session_state.models[selected_model_name] = model
-                    break
-        
-        if model:
-            df_raw = st.session_state.get("df_raw")
-            numeric_cols = model.get("numeric_cols", list(model.get("item_stats", {}).keys()))
-            
-            if df_raw is None:
-                st.warning("⚠️ 历史数据不可用，无法进行趋势分析")
-            else:
-                df_numeric = df_raw[numeric_cols].apply(pd.to_numeric, errors='coerce')
-                if model.get("group_col") and model.get("group_value"):
-                    mask = df_raw[model["group_col"]] == model["group_value"]
-                    df_numeric = df_numeric[mask]
-                
-                # ===== 1. 趋势分析 =====
-                st.subheader("📈 趋势分析")
-                st.markdown("分析各检测项目最近的数据走势，提前发现缓慢偏移。")
-                
-                trend_window = st.slider("趋势计算窗口（最近N条数据）", min_value=5, max_value=50, value=15, step=5, key="trend_window")
-                
-                trend_data = []
-                for col in numeric_cols:
-                    series = df_numeric[col].dropna()
-                    if len(series) < trend_window:
-                        continue
-                    
-                    recent = series.iloc[-trend_window:]
-                    
-                    # 线性回归算斜率
-                    x = np.arange(len(recent))
-                    y = recent.values
-                    if len(x) > 1:
-                        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
-                        mean_val = series.mean()
-                        std_val = series.std()
-                        
-                        # 斜率转化为每日变化百分比（相对均值）
-                        daily_pct = (slope / mean_val * 100) if mean_val != 0 else 0
-                        
-                        # 判断趋势方向
-                        if abs(daily_pct) < 0.01:
-                            direction = "➡️ 平稳"
-                            level = ""
-                        elif daily_pct > 0:
-                            if abs(slope) > 2 * std_err:
-                                direction = "📈 上升"
-                                level = "⚠️ 显著" if p_value < 0.05 else ""
-                            else:
-                                direction = "📈 微升"
-                                level = ""
-                        else:
-                            if abs(slope) > 2 * std_err:
-                                direction = "📉 下降"
-                                level = "⚠️ 显著" if p_value < 0.05 else ""
-                            else:
-                                direction = "📉 微降"
-                                level = ""
-                        
-                        decimals = model["item_stats"].get(col, {}).get("decimals", 3)
-                        trend_data.append({
-                            "项目": col,
-                            "趋势": direction,
-                            "显著性": level,
-                            "最近均值": round(float(recent.mean()), decimals),
-                            "整体均值": round(mean_val, decimals),
-                            "日均变化": f"{daily_pct:+.3f}%",
-                            "p值": f"{p_value:.4f}",
-                            "最近窗口均值偏移": f"{((recent.mean()-mean_val)/std_val):+.2f}σ" if std_val > 0 else "-"
-                        })
-                
-                if trend_data:
-                    trend_df = pd.DataFrame(trend_data)
-                    # 按趋势显著性排序
-                    trend_df = trend_df.sort_values("日均变化", key=lambda x: x.str.replace('%','').str.replace('+','').astype(float).abs(), ascending=False)
-                    st.dataframe(trend_df, use_container_width=True, hide_index=True)
-                    
-                    # 趋势可视化
-                    st.subheader("趋势折线图")
-                    selected_trend_col = st.selectbox("选择项目查看趋势", [t["项目"] for t in trend_data], key="trend_col_select")
-                    
-                    if selected_trend_col:
-                        series = df_numeric[selected_trend_col].dropna()
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(y=series.values, mode='lines+markers', name=selected_trend_col, line=dict(color='#4fc3f7')))
-                        
-                        # 标记趋势线
-                        if len(series) >= trend_window:
-                            recent = series.iloc[-trend_window:]
-                            x_recent = np.arange(len(series)-trend_window, len(series))
-                            slope, intercept, _, _, _ = stats.linregress(x_recent, recent.values)
-                            fig.add_trace(go.Scatter(
-                                x=x_recent, y=slope * x_recent + intercept,
-                                mode='lines', name='趋势线', line=dict(color='#ff9800', dash='dash')
-                            ))
-                        
-                        # 标记均值线
-                        stats_info = model["item_stats"].get(selected_trend_col, {})
-                        if stats_info:
-                            fig.add_hline(y=stats_info["mean"], line_dash="dot", line_color="#00c853", annotation_text=f"均值:{stats_info['mean']}")
-                        
-                        fig.update_layout(
-                            height=400,
-                            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                            font_color='#b0bec5', title_font_color='#4fc3f7',
-                            title=f"{selected_trend_col} 数据趋势",
-                            xaxis_title="数据序号", yaxis_title=selected_trend_col
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("数据量不足，无法计算趋势")
-                
-                # ===== 2. 波动率变化 =====
-                st.markdown("---")
-                st.subheader("📊 波动率分析")
-                st.markdown("检测数据波动是否异常增大——波动突然变大往往是过程失控的早期信号。")
-                
-                cv_window = st.slider("波动计算窗口（最近N条数据）", min_value=5, max_value=50, value=20, step=5, key="cv_window")
-                
-                volatility_data = []
-                for col in numeric_cols:
-                    series = df_numeric[col].dropna()
-                    if len(series) < cv_window + 10:
-                        continue
-                    
-                    recent = series.iloc[-cv_window:]
-                    historical = series.iloc[:-cv_window]
-                    
-                    if len(historical) < 5:
-                        continue
-                    
-                    recent_cv = (recent.std() / recent.mean() * 100) if recent.mean() != 0 else 0
-                    hist_cv = (historical.std() / historical.mean() * 100) if historical.mean() != 0 else 0
-                    
-                    cv_change = recent_cv - hist_cv
-                    cv_ratio = recent_cv / hist_cv if hist_cv > 0 else 0
-                    
-                    if cv_ratio > 1.5:
-                        status = "🔴 波动显著增大"
-                    elif cv_ratio > 1.2:
-                        status = "🟡 波动增大"
-                    elif cv_ratio < 0.8:
-                        status = "🟢 波动减小"
-                    else:
-                        status = "➡️ 波动正常"
-                    
-                    decimals = model["item_stats"].get(col, {}).get("decimals", 3)
-                    volatility_data.append({
-                        "项目": col,
-                        "状态": status,
-                        "历史CV(%)": round(hist_cv, 3),
-                        "最近CV(%)": round(recent_cv, 3),
-                        "变化率": f"{cv_change:+.3f}%",
-                        "波动倍数": f"{cv_ratio:.2f}x",
-                        "最近标准差": round(float(recent.std()), decimals),
-                        "历史标准差": round(float(historical.std()), decimals)
-                    })
-                
-                if volatility_data:
-                    vol_df = pd.DataFrame(volatility_data)
-                    vol_df = vol_df.sort_values("波动倍数", key=lambda x: x.str.replace('x','').astype(float).abs(), ascending=False)
-                    st.dataframe(vol_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("数据量不足，无法计算波动率")
-                
-                # ===== 3. 高频异常项目统计 =====
-                st.markdown("---")
-                st.subheader("🔥 高频异常项目统计")
-                st.markdown("哪些项目最经常出异常？反复异常可能不是数据问题，而是采样或设备问题。")
-                
-                # 对所有历史数据批量检测
-                anomaly_count = {}
-                total_anomaly_records = 0
-                sample_size = min(len(df_numeric), 200)  # 最多检测200条
-                test_df = df_numeric.iloc[-sample_size:]
-                
-                progress_diag = st.progress(0, text="正在批量诊断历史数据...")
-                
-                for idx in range(len(test_df)):
-                    row = test_df.iloc[idx].to_dict()
-                    row_anomalies = check_anomaly(row, model)
-                    
-                    for a in row_anomalies:
-                        col_name = a["项目"].split(" → ")[0]  # 逻辑异常取第一个项目
-                        if col_name not in anomaly_count:
-                            anomaly_count[col_name] = {"总次数": 0, "严重异常": 0, "轻度异常": 0, "逻辑异常": 0, "极值": 0}
-                        anomaly_count[col_name]["总次数"] += 1
-                        total_anomaly_records += 1
-                        
-                        if "严重异常" in a["类型"]:
-                            anomaly_count[col_name]["严重异常"] += 1
-                        elif "轻度异常" in a["类型"]:
-                            anomaly_count[col_name]["轻度异常"] += 1
-                        elif "逻辑异常" in a["类型"]:
-                            anomaly_count[col_name]["逻辑异常"] += 1
-                        elif "历史最" in a["类型"]:
-                            anomaly_count[col_name]["极值"] += 1
-                    
-                    progress_diag.progress((idx + 1) / len(test_df), text=f"已诊断 {idx+1}/{len(test_df)} 条")
-                
-                if anomaly_count:
-                    freq_data = []
-                    for col, counts in sorted(anomaly_count.items(), key=lambda x: x[1]["总次数"], reverse=True):
-                        freq_data.append({
-                            "项目": col,
-                            "异常总次数": counts["总次数"],
-                            "严重异常": counts["严重异常"],
-                            "轻度异常": counts["轻度异常"],
-                            "逻辑异常": counts["逻辑异常"],
-                            "极值标记": counts["极值"],
-                            "异常率": f"{counts['总次数']/sample_size*100:.1f}%"
-                        })
-                    
-                    freq_df = pd.DataFrame(freq_data)
-                    st.dataframe(freq_df, use_container_width=True, hide_index=True)
-                    
-                    # 可视化
-                    if len(freq_data) > 0:
-                        fig_freq = px.bar(
-                            freq_df.head(10), x="项目", y="异常总次数",
-                            color="异常总次数", color_continuous_scale="Reds",
-                            title="异常项目排名（Top 10）"
-                        )
-                        fig_freq.update_layout(
-                            height=400,
-                            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                            font_color='#b0bec5', title_font_color='#4fc3f7'
-                        )
-                        st.plotly_chart(fig_freq, use_container_width=True)
-                else:
-                    st.success("✅ 所检查历史数据均无异常")
-
-
-# ==================== 页面7：异常报告 ====================
+# ==================== 页面6：异常报告 ====================
 elif page == "📋 异常报告":
     st.header("📋 异常报告")
     
@@ -2275,10 +2051,10 @@ elif page == "📋 异常报告":
         st.subheader("📊 总览")
         
         # 统计各类异常数量
-        severe_count = len([a for a in anomalies if "严重异常" in a.get("类型", "")])
-        mild_count = len([a for a in anomalies if "轻度异常" in a.get("类型", "")])
-        logic_count = len([a for a in anomalies if "逻辑异常" in a.get("类型", "")])
-        extreme_count = len([a for a in anomalies if "历史最高值" in a.get("类型", "") or "历史最低值" in a.get("类型", "")])
+        severe_count = len([a for a in anomalies if "严重" in a.get("类型", "")])
+        mild_count = len([a for a in anomalies if "🟡" in a.get("类型", "")])
+        logic_count = len([a for a in anomalies if "关系异常" in a.get("类型", "")])
+        extreme_count = len([a for a in anomalies if "创历史新高" in a.get("类型", "") or "创历史新低" in a.get("类型", "")])
         
         # 涉及的唯一项目数
         affected_items = set(a["项目"] for a in anomalies)
@@ -2313,107 +2089,40 @@ elif page == "📋 异常报告":
         
         st.markdown("---")
         
-        # ===== 第二层：项目维度汇总 =====
-        st.subheader("📁 项目维度汇总")
-        st.markdown("按检测项目聚合异常信息，快速定位问题项目。")
-        
-        # 按项目聚合
-        item_summary = {}
-        for a in anomalies:
-            item = a["项目"]
-            if item not in item_summary:
-                item_summary[item] = {
-                    "项目": item,
-                    "严重异常": 0,
-                    "轻度异常": 0,
-                    "逻辑异常": 0,
-                    "历史极值": 0,
-                    "总异常数": 0,
-                    "最高偏离": "",
-                    "检测值范围": [],
-                }
-            atype = a.get("类型", "")
-            if "严重异常" in atype:
-                item_summary[item]["严重异常"] += 1
-            elif "轻度异常" in atype:
-                item_summary[item]["轻度异常"] += 1
-            elif "逻辑异常" in atype:
-                item_summary[item]["逻辑异常"] += 1
-            elif "历史最高值" in atype or "历史最低值" in atype:
-                item_summary[item]["历史极值"] += 1
-            
-            item_summary[item]["总异常数"] += 1
-            item_summary[item]["检测值范围"].append(str(a.get("检测值", "")))
-            
-            # 记录最高偏离
-            deviation = a.get("偏离程度", "")
-            if deviation and ("Z=" in deviation):
-                try:
-                    z_val = float(deviation.replace("Z=", "").replace("σ", ""))
-                    current_max = item_summary[item]["最高偏离"]
-                    if not current_max or (current_max and z_val > float(current_max.replace("Z=", "").replace("σ", ""))):
-                        item_summary[item]["最高偏离"] = deviation
-                except:
-                    pass
-        
-        # 排序：总异常数降序
-        item_list = sorted(item_summary.values(), key=lambda x: x["总异常数"], reverse=True)
-        
-        # 用表格展示
-        summary_rows = []
-        for item in item_list:
-            summary_rows.append({
-                "项目": item["项目"],
-                "🔴严重": item["严重异常"] if item["严重异常"] > 0 else "-",
-                "🟡轻度": item["轻度异常"] if item["轻度异常"] > 0 else "-",
-                "🔵逻辑": item["逻辑异常"] if item["逻辑异常"] > 0 else "-",
-                "⬆️⬇️极值": item["历史极值"] if item["历史极值"] > 0 else "-",
-                "总异常数": item["总异常数"],
-                "最高偏离": item["最高偏离"] if item["最高偏离"] else "-",
-            })
-        
-        if summary_rows:
-            summary_df = pd.DataFrame(summary_rows)
-            st.dataframe(summary_df, use_container_width=True, hide_index=True)
-        else:
-            st.info("无项目汇总数据")
-        
-        st.markdown("---")
-        
+
         # ===== 第四层：异常概览图 =====
         st.subheader("📊 异常概览图")
-        
-        if summary_rows:
-            # 柱状图：X=项目名，Y=异常次数，按类型分颜色
-            chart_items = [r["项目"] for r in summary_rows]
-            chart_severe = [r["🔴严重"] if r["🔴严重"] != "-" else 0 for r in summary_rows]
-            chart_mild = [r["🟡轻度"] if r["🟡轻度"] != "-" else 0 for r in summary_rows]
-            chart_logic = [r["🔵逻辑"] if r["🔵逻辑"] != "-" else 0 for r in summary_rows]
-            chart_extreme = [r["⬆️⬇️极值"] if r["⬆️⬇️极值"] != "-" else 0 for r in summary_rows]
-            
-            fig = go.Figure()
-            fig.add_trace(go.Bar(name="严重异常", x=chart_items, y=chart_severe, marker_color="#d32f2f"))
-            fig.add_trace(go.Bar(name="轻度异常", x=chart_items, y=chart_mild, marker_color="#ff9800"))
-            fig.add_trace(go.Bar(name="逻辑异常", x=chart_items, y=chart_logic, marker_color="#1a73e8"))
-            fig.add_trace(go.Bar(name="历史极值", x=chart_items, y=chart_extreme, marker_color="#607d8b"))
-            
-            fig.update_layout(
-                barmode="stack",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font_color="#b0bec5",
-                xaxis_title="检测项目",
-                yaxis_title="异常次数",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                height=350,
-                margin=dict(l=40, r=20, t=30, b=60),
-            )
-            fig.update_xaxes(tickangle=-30)
-            st.plotly_chart(fig, use_container_width=True)
+
+        # 直接从 anomalies 构建图表数据
+        chart_items = sorted(set(a["项目"] for a in anomalies))
+        chart_severe = [sum(1 for a in anomalies if a["项目"] == item and "严重" in a.get("类型", "")) for item in chart_items]
+        chart_mild = [sum(1 for a in anomalies if a["项目"] == item and "🟡" in a.get("类型", "")) for item in chart_items]
+        chart_logic = [sum(1 for a in anomalies if a["项目"] == item and "关系异常" in a.get("类型", "")) for item in chart_items]
+        chart_extreme = [sum(1 for a in anomalies if a["项目"] == item and ("创历史新高" in a.get("类型", "") or "创历史新低" in a.get("类型", ""))) for item in chart_items]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name="严重异常", x=chart_items, y=chart_severe, marker_color="#d32f2f"))
+        fig.add_trace(go.Bar(name="轻度异常", x=chart_items, y=chart_mild, marker_color="#ff9800"))
+        fig.add_trace(go.Bar(name="逻辑异常", x=chart_items, y=chart_logic, marker_color="#1a73e8"))
+        fig.add_trace(go.Bar(name="历史极值", x=chart_items, y=chart_extreme, marker_color="#607d8b"))
+
+        fig.update_layout(
+            barmode="stack",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#b0bec5",
+            xaxis_title="检测项目",
+            yaxis_title="异常次数",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            height=350,
+            margin=dict(l=40, r=20, t=30, b=60),
+        )
+        fig.update_xaxes(tickangle=-30)
+        st.plotly_chart(fig, use_container_width=True)
         
         st.markdown("---")
         
-        # ===== 第三层：可筛选的异常明细表 =====
+        # ===== 第五层：可筛选的异常明细表 =====
         st.subheader("🔍 异常明细")
         st.markdown("筛选和查看每条异常的详细信息。")
         
@@ -2457,7 +2166,7 @@ elif page == "📋 异常报告":
             st.info("当前筛选条件下无异常记录")
 
 
-# ==================== 页面6：模型管理 ====================
+# ==================== 页面7：模型管理 ====================
 elif page == "📁 模型管理":
     st.header("📁 模型管理")
     
@@ -2588,7 +2297,7 @@ elif page == "💬 功能反馈":
     st.markdown("---")
     st.subheader("📋 已提交的反馈")
     
-    feedback_files = [f for f in os.listdir(FEEDBACK_DIR) if f.endswith(".json")] if os.path.exists(FEEDBACK_DIR) else []
+    feedback_files = [f for f in os.listdir(FEEDBACK_DIR) if f.startswith("feedback_") and f.endswith(".json")] if os.path.exists(FEEDBACK_DIR) else []
     if feedback_files:
         for ff in sorted(feedback_files, reverse=True)[:20]:
             with open(os.path.join(FEEDBACK_DIR, ff), "r", encoding="utf-8") as f:
